@@ -689,3 +689,117 @@ class TestRegisterSessionMcpServers:
         with patch("tools.mcp_tool.register_mcp_servers", side_effect=RuntimeError("boom")):
             # Should not raise
             await agent._register_session_mcp_servers(state, [server])
+
+
+# ---------------------------------------------------------------------------
+# _session/steering extension (Buzz mid-turn steer)
+# ---------------------------------------------------------------------------
+
+
+class TestSteeringExtension:
+    """The `_session/steering` ACP extension keeps clients like Buzz from
+    cancelling an in-flight turn when a new message arrives mid-turn."""
+
+    @pytest.mark.asyncio
+    async def test_initialize_advertises_steering_supported(self, agent):
+        resp = await agent.initialize(protocol_version=1)
+        payload = resp.model_dump(by_alias=True, exclude_none=True)
+        assert payload["_meta"]["steering"]["supported"] is True
+
+    @pytest.mark.asyncio
+    async def test_steer_injects_into_running_session(self, agent, mock_manager):
+        state = mock_manager.create_session(cwd="/tmp")
+        state.is_running = True
+        state.agent.steer = MagicMock(return_value=True)
+
+        result = await agent.ext_method(
+            "session/steering",
+            {
+                "sessionId": state.session_id,
+                "prompt": [{"type": "text", "text": "mid-turn correction"}],
+            },
+        )
+
+        assert result == {"outcome": "injected"}
+        state.agent.steer.assert_called_once_with("mid-turn correction")
+
+    @pytest.mark.asyncio
+    async def test_steer_joins_multiple_text_blocks(self, agent, mock_manager):
+        state = mock_manager.create_session(cwd="/tmp")
+        state.is_running = True
+        state.agent.steer = MagicMock(return_value=True)
+
+        await agent.ext_method(
+            "session/steering",
+            {
+                "sessionId": state.session_id,
+                "prompt": [
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": "second"},
+                ],
+            },
+        )
+
+        state.agent.steer.assert_called_once_with("first\n\nsecond")
+
+    @pytest.mark.asyncio
+    async def test_steer_idle_session_raises_so_client_falls_back(
+        self, agent, mock_manager
+    ):
+        state = mock_manager.create_session(cwd="/tmp")
+        state.is_running = False
+        state.agent.steer = MagicMock(return_value=True)
+
+        with pytest.raises(acp.RequestError):
+            await agent.ext_method(
+                "session/steering",
+                {
+                    "sessionId": state.session_id,
+                    "prompt": [{"type": "text", "text": "late message"}],
+                },
+            )
+        state.agent.steer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_steer_refused_by_agent_raises_so_client_falls_back(
+        self, agent, mock_manager
+    ):
+        state = mock_manager.create_session(cwd="/tmp")
+        state.is_running = True
+        state.agent.steer = MagicMock(return_value=False)
+
+        with pytest.raises(acp.RequestError):
+            await agent.ext_method(
+                "session/steering",
+                {
+                    "sessionId": state.session_id,
+                    "prompt": [{"type": "text", "text": "refused"}],
+                },
+            )
+
+    @pytest.mark.asyncio
+    async def test_steer_unknown_session_raises(self, agent):
+        with pytest.raises(acp.RequestError):
+            await agent.ext_method(
+                "session/steering",
+                {
+                    "sessionId": "does-not-exist",
+                    "prompt": [{"type": "text", "text": "hello"}],
+                },
+            )
+
+    @pytest.mark.asyncio
+    async def test_steer_empty_prompt_raises(self, agent, mock_manager):
+        state = mock_manager.create_session(cwd="/tmp")
+        state.is_running = True
+
+        with pytest.raises(acp.RequestError):
+            await agent.ext_method(
+                "session/steering",
+                {"sessionId": state.session_id, "prompt": []},
+            )
+
+    @pytest.mark.asyncio
+    async def test_unknown_extension_method_raises_method_not_found(self, agent):
+        with pytest.raises(acp.RequestError):
+            await agent.ext_method("other/unknown", {})

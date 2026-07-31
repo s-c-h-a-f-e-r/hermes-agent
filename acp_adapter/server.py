@@ -1071,7 +1071,79 @@ class HermesACPAgent(acp.Agent):
                 ),
             ),
             auth_methods=auth_methods,
+            # Advertise the cross-adapter mid-turn steering extension
+            # (`_session/steering`, also shipped by claude-agent-acp and
+            # codex-acp). Clients like Buzz read `_meta.steering.supported`
+            # from this response; without it they fall back to cancelling
+            # the in-flight turn whenever a new message arrives mid-turn.
+            field_meta={"steering": {"supported": True}},
         )
+
+    async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle ACP extension requests (methods prefixed with ``_``).
+
+        The router strips the leading underscore before dispatching, so the
+        wire method ``_session/steering`` arrives as ``session/steering``.
+
+        ``_session/steering`` injects a user message into a running turn
+        without interrupting it (params ``{sessionId, prompt}`` where
+        ``prompt`` is a list of ACP text content blocks; result
+        ``{"outcome": "injected"}``). When the session is idle, the steer
+        refuses with a JSON-RPC error — clients treat that as "steer did
+        not land" and fall back to their cancel/re-prompt path, so the
+        message is never dropped. ``startedNewTurn`` is intentionally not
+        implemented: starting a turn requires the full prompt() flow.
+        """
+        if method.lstrip("_") == "session/steering":
+            session_id = params.get("sessionId")
+            state = (
+                self.session_manager.get_session(session_id)
+                if isinstance(session_id, str) and session_id
+                else None
+            )
+            if state is None:
+                raise acp.RequestError.invalid_params(
+                    {"reason": f"unknown sessionId for steer: {session_id!r}"}
+                )
+
+            parts: list[str] = []
+            prompt_blocks = params.get("prompt")
+            if isinstance(prompt_blocks, list):
+                for block in prompt_blocks:
+                    if isinstance(block, dict):
+                        text = block.get("text")
+                        if isinstance(text, str) and text.strip():
+                            parts.append(text)
+                    elif isinstance(block, str) and block.strip():
+                        parts.append(block)
+            steer_text = "\n\n".join(parts).strip()
+            if not steer_text:
+                raise acp.RequestError.invalid_params(
+                    {"reason": "steer prompt contained no text"}
+                )
+
+            with state.runtime_lock:
+                running = state.is_running
+            if running and hasattr(state.agent, "steer"):
+                try:
+                    if state.agent.steer(steer_text):
+                        preview = steer_text[:80] + ("..." if len(steer_text) > 80 else "")
+                        logger.info(
+                            "ACP steer injected into running session %s: %s",
+                            state.session_id,
+                            preview,
+                        )
+                        return {"outcome": "injected"}
+                except Exception:
+                    logger.warning(
+                        "ACP steer failed for session %s", state.session_id, exc_info=True
+                    )
+            # Idle session (or steer refused): report failure so the client
+            # re-delivers the message through its normal prompt path.
+            raise acp.RequestError.invalid_request(
+                {"reason": "no running turn to steer; re-deliver as a prompt"}
+            )
+        raise acp.RequestError.method_not_found(f"_{method.lstrip('_')}")
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
         # Only accept authenticate() calls whose method_id matches the
@@ -2313,7 +2385,7 @@ class HermesACPAgent(acp.Agent):
                     return f"⏩ Steer queued for the active turn: {preview}"
             except Exception as exc:
                 logger.warning("ACP steer failed for session %s: %s", state.session_id, exc)
-                return f"⚠️ Steer failed: {exc}"
+                return f" Steer failed: {exc}"
 
         with state.runtime_lock:
             state.queued_prompts.append(steer_text)
